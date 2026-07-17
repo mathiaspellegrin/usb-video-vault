@@ -1,0 +1,13 @@
+# Your actual encrypted videos and drop folder -- never tracked
+vault/
+incoming/
+videos.vault*
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor/OS cruft
+.claude/
+.DS_Store
+Thumbs.db
