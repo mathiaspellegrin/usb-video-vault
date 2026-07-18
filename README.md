@@ -67,6 +67,10 @@ memory only for as long as the app window is open, never written to disk.
   with it. Back up the `vault/` folder yourself if that matters to you.
 - Tested primarily on Linux; the Windows/macOS paths in `watch_selected()`
   (`os.startfile` / `open`) are implemented but not exercised in CI.
+- FAT32 isn't journaled: unplugging the drive mid-write (during a compress or
+  while the vault is being updated) can corrupt the filesystem itself, not
+  just the file being written. Always close the app and eject/unmount the
+  drive properly before disconnecting it.
 
 ## Development
 
@@ -75,6 +79,15 @@ paths:
 
 ```
 python3 vaultlib.py
+```
+
+`test_integration.py` exercises the real pipeline end to end: generates a
+synthetic test clip, compresses it with the same ffmpeg command the app
+uses, stores and reads it back through the vault, and confirms the result
+is still a playable video. Skips itself if ffmpeg isn't installed.
+
+```
+python3 test_integration.py
 ```
 
 ## License
