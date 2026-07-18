@@ -207,54 +207,71 @@ class VaultApp:
         here, only push updates through self._progress_queue."""
         added = []
         for path, name in jobs:
-            before = os.path.getsize(path)
-            duration = self._probe_duration_seconds(path)
-            self._progress_queue.put(("status", name, duration is None))
-
-            fd, tmp = tempfile.mkstemp(suffix=".mp4")
-            os.close(fd)
+            # a bug in one file's handling must never take the rest of the
+            # batch down with it, so every per-file failure mode funnels
+            # through here instead of being allowed to escape the loop.
             try:
-                proc = subprocess.Popen(
-                    ["ffmpeg", "-y", "-i", path,
-                     "-vcodec", "libx265", "-crf", str(CRF), "-preset", "medium",
-                     "-tag:v", "hvc1", "-c:a", "copy",
-                     "-progress", "pipe:1", "-nostats", "-loglevel", "error",
-                     tmp],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                )
-                self._current_proc = proc
-                for line in proc.stdout:
-                    if duration and line.startswith("out_time_ms="):
-                        elapsed_seconds = int(line.strip().split("=", 1)[1]) / 1_000_000
-                        self._progress_queue.put(("progress", min(100, elapsed_seconds / duration * 100)))
-                stderr = proc.stderr.read()
-                code = proc.wait()
-                self._current_proc = None
-                if code != 0:
-                    raise subprocess.CalledProcessError(code, "ffmpeg", stderr=stderr)
-            except subprocess.CalledProcessError as e:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-                self._progress_queue.put(("error", f"ffmpeg failed on {name}:\n{e.stderr}"))
-                continue
-            except OSError as e:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-                self._progress_queue.put(("error", f"Compressing {name} failed (is the drive still connected?):\n{e}"))
-                continue
-
-            after = os.path.getsize(tmp)
-            try:
-                vaultlib.put(VAULT_DIR, self.password, name, tmp)
-                os.remove(tmp)
-                os.remove(path)
-            except OSError as e:
-                self._progress_queue.put(("error", f"Could not save {name} to the vault (is the drive still connected?):\n{e}"))
-                continue
-            added.append(f"{name}: {before:,} -> {after:,} bytes ({100 * after / before:.0f}%)")
-            self._progress_queue.put(("refresh",))  # show it in the list right away, don't wait for the whole batch
+                if self._compress_one(path, name, added):
+                    self._progress_queue.put(("refresh",))
+            except Exception as e:
+                self._progress_queue.put(("error", f"Unexpected error compressing {name}, skipping it:\n{e}"))
 
         self._progress_queue.put(("done", added))
+
+    def _compress_one(self, path: str, name: str, added: list) -> bool:
+        before = os.path.getsize(path)
+        duration = self._probe_duration_seconds(path)
+        self._progress_queue.put(("status", name, duration is None))
+
+        fd, tmp = tempfile.mkstemp(suffix=".mp4")
+        os.close(fd)
+        try:
+            proc = subprocess.Popen(
+                ["ffmpeg", "-y", "-i", path,
+                 "-vcodec", "libx265", "-crf", str(CRF), "-preset", "medium",
+                 "-tag:v", "hvc1", "-c:a", "copy",
+                 "-progress", "pipe:1", "-nostats", "-loglevel", "error",
+                 tmp],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            self._current_proc = proc
+            for line in proc.stdout:
+                if duration and line.startswith("out_time_ms="):
+                    # ffmpeg emits "N/A" (and briefly a small negative value)
+                    # before encoding actually starts producing timestamps
+                    raw = line.strip().split("=", 1)[1]
+                    try:
+                        elapsed_seconds = int(raw) / 1_000_000
+                    except ValueError:
+                        continue
+                    percent = max(0, min(100, elapsed_seconds / duration * 100))
+                    self._progress_queue.put(("progress", percent))
+            stderr = proc.stderr.read()
+            code = proc.wait()
+            self._current_proc = None
+            if code != 0:
+                raise subprocess.CalledProcessError(code, "ffmpeg", stderr=stderr)
+        except subprocess.CalledProcessError as e:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            self._progress_queue.put(("error", f"ffmpeg failed on {name}:\n{e.stderr}"))
+            return False
+        except OSError as e:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            self._progress_queue.put(("error", f"Compressing {name} failed (is the drive still connected?):\n{e}"))
+            return False
+
+        after = os.path.getsize(tmp)
+        try:
+            vaultlib.put(VAULT_DIR, self.password, name, tmp)
+            os.remove(tmp)
+            os.remove(path)
+        except OSError as e:
+            self._progress_queue.put(("error", f"Could not save {name} to the vault (is the drive still connected?):\n{e}"))
+            return False
+        added.append(f"{name}: {before:,} -> {after:,} bytes ({100 * after / before:.0f}%)")
+        return True
 
     def _poll_progress(self) -> None:
         try:
