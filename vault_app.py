@@ -38,6 +38,8 @@ class VaultApp:
         self.root = root
         self.password = b""
         self.temp_files = []
+        self.compressing = False
+        self._current_proc = None
 
         root.title("Videos")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -185,6 +187,7 @@ class VaultApp:
             return
 
         self.compress_btn.config(state=tk.DISABLED)
+        self.compressing = True
         threading.Thread(target=self._compress_worker, args=(jobs,), daemon=True).start()
         self.root.after(100, self._poll_progress)
 
@@ -219,12 +222,14 @@ class VaultApp:
                      tmp],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 )
+                self._current_proc = proc
                 for line in proc.stdout:
                     if duration and line.startswith("out_time_ms="):
                         elapsed_seconds = int(line.strip().split("=", 1)[1]) / 1_000_000
                         self._progress_queue.put(("progress", min(100, elapsed_seconds / duration * 100)))
                 stderr = proc.stderr.read()
                 code = proc.wait()
+                self._current_proc = None
                 if code != 0:
                     raise subprocess.CalledProcessError(code, "ffmpeg", stderr=stderr)
             except subprocess.CalledProcessError as e:
@@ -247,6 +252,7 @@ class VaultApp:
                 self._progress_queue.put(("error", f"Could not save {name} to the vault (is the drive still connected?):\n{e}"))
                 continue
             added.append(f"{name}: {before:,} -> {after:,} bytes ({100 * after / before:.0f}%)")
+            self._progress_queue.put(("refresh",))  # show it in the list right away, don't wait for the whole batch
 
         self._progress_queue.put(("done", added))
 
@@ -266,6 +272,8 @@ class VaultApp:
                         self.progress["value"] = 0
                 elif kind == "progress":
                     self.progress["value"] = payload[0]
+                elif kind == "refresh":
+                    self.refresh()  # a video just landed in the vault -- show it now, don't wait for the batch
                 elif kind == "error":
                     messagebox.showerror("Videos", payload[0])
                 elif kind == "done":
@@ -273,6 +281,7 @@ class VaultApp:
                     self.progress.config(mode="determinate")
                     self.progress["value"] = 0
                     self.compress_btn.config(state=tk.NORMAL)
+                    self.compressing = False
                     self.refresh()
                     self.scan_incoming()
                     added = payload[0]
@@ -284,6 +293,16 @@ class VaultApp:
         self.root.after(100, self._poll_progress)
 
     def on_close(self) -> None:
+        if self.compressing:
+            if not messagebox.askyesno(
+                "Videos",
+                "A compression is still running. Closing now abandons it -- "
+                "the video currently being compressed won't be saved. Close anyway?",
+            ):
+                return
+            if self._current_proc is not None:
+                self._current_proc.terminate()
+
         for tmp in self.temp_files:
             try:
                 os.remove(tmp)
