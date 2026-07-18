@@ -3,8 +3,10 @@
 incoming/ straight into the encrypted vault. Double-click to run.
 
 The Compress button turns red and shows a count when it spots new files in
-incoming/ -- it never compresses on its own, only when you click it, so a
-long ffmpeg run (which freezes this window) only ever starts when you choose.
+incoming/ -- it never compresses on its own, only when you click it. Once
+clicked, ffmpeg runs in a background thread with a progress bar so the
+window stays responsive; name-conflict dialogs are all resolved up front
+on the main thread before that background work starts.
 
 ponytail: no real "clear on USB unplug" detection -- that's OS-specific
 (udev/WMI/IOKit) and not portable. Instead the password lives in memory only
@@ -15,12 +17,14 @@ the password. Add real unplug detection only if this genuinely isn't enough.
 import glob
 import os
 import platform
+import queue
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import tkinter as tk
-from tkinter import messagebox, simpledialog
+from tkinter import messagebox, simpledialog, ttk
 
 import vaultlib
 
@@ -53,6 +57,10 @@ class VaultApp:
 
         self.status = tk.Label(root, text="", fg="gray")
         self.status.pack(pady=(0, 10))
+
+        self.progress = ttk.Progressbar(root, orient="horizontal", length=300, mode="determinate", maximum=100)
+        self.progress.pack(pady=(0, 10))
+        self._progress_queue = queue.Queue()
 
         self.unlock()
         self.refresh()
@@ -141,20 +149,14 @@ class VaultApp:
         if not shutil.which("ffmpeg"):
             messagebox.showerror("Videos", "ffmpeg not found. Install it first (apt/brew/choco install ffmpeg).")
             return
-        try:
-            self.add_new(found)
-        finally:
-            # always resets the status/button, even if something below raised an
-            # exception we didn't anticipate (e.g. the drive dropping mid-write)
-            self.refresh()
-            self.scan_incoming()
 
-    def add_new(self, found: list) -> None:
+        # name-conflict dialogs need the main thread, so resolve all of them
+        # up front -- only the (slow, freeze-prone) ffmpeg pass runs in the
+        # background thread below.
         existing = set(vaultlib.list_entries(VAULT_DIR, self.password)) if os.path.isdir(VAULT_DIR) else set()
-        added = []
+        jobs = []
         for path in found:
             name = os.path.basename(path)
-
             if name in existing:
                 choice = messagebox.askyesnocancel(
                     "Videos",
@@ -176,40 +178,110 @@ class VaultApp:
                     if not new_name:
                         continue
                     name = new_name
+            existing.add(name)
+            jobs.append((path, name))
 
-            self.set_status(f"Compressing {name}...")
+        if not jobs:
+            return
+
+        self.compress_btn.config(state=tk.DISABLED)
+        threading.Thread(target=self._compress_worker, args=(jobs,), daemon=True).start()
+        self.root.after(100, self._poll_progress)
+
+    def _probe_duration_seconds(self, path: str):
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", path],
+                capture_output=True, text=True, check=True,
+            )
+            return float(result.stdout.strip())
+        except (subprocess.CalledProcessError, ValueError, OSError):
+            return None
+
+    def _compress_worker(self, jobs: list) -> None:
+        """Runs in a background thread -- never touch Tkinter widgets directly
+        here, only push updates through self._progress_queue."""
+        added = []
+        for path, name in jobs:
             before = os.path.getsize(path)
+            duration = self._probe_duration_seconds(path)
+            self._progress_queue.put(("status", name, duration is None))
+
             fd, tmp = tempfile.mkstemp(suffix=".mp4")
             os.close(fd)
             try:
-                subprocess.run(
+                proc = subprocess.Popen(
                     ["ffmpeg", "-y", "-i", path,
                      "-vcodec", "libx265", "-crf", str(CRF), "-preset", "medium",
-                     "-tag:v", "hvc1", "-c:a", "copy", tmp],
-                    check=True, capture_output=True, text=True,
+                     "-tag:v", "hvc1", "-c:a", "copy",
+                     "-progress", "pipe:1", "-nostats", "-loglevel", "error",
+                     tmp],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 )
+                for line in proc.stdout:
+                    if duration and line.startswith("out_time_ms="):
+                        elapsed_seconds = int(line.strip().split("=", 1)[1]) / 1_000_000
+                        self._progress_queue.put(("progress", min(100, elapsed_seconds / duration * 100)))
+                stderr = proc.stderr.read()
+                code = proc.wait()
+                if code != 0:
+                    raise subprocess.CalledProcessError(code, "ffmpeg", stderr=stderr)
             except subprocess.CalledProcessError as e:
-                os.remove(tmp)
-                messagebox.showerror("Videos", f"ffmpeg failed on {name}:\n{e.stderr}")
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+                self._progress_queue.put(("error", f"ffmpeg failed on {name}:\n{e.stderr}"))
                 continue
             except OSError as e:
                 if os.path.exists(tmp):
                     os.remove(tmp)
-                messagebox.showerror("Videos", f"Compressing {name} failed (is the drive still connected?):\n{e}")
+                self._progress_queue.put(("error", f"Compressing {name} failed (is the drive still connected?):\n{e}"))
                 continue
+
             after = os.path.getsize(tmp)
             try:
                 vaultlib.put(VAULT_DIR, self.password, name, tmp)
                 os.remove(tmp)
                 os.remove(path)
             except OSError as e:
-                messagebox.showerror("Videos", f"Could not save {name} to the vault (is the drive still connected?):\n{e}")
+                self._progress_queue.put(("error", f"Could not save {name} to the vault (is the drive still connected?):\n{e}"))
                 continue
-            existing.add(name)
             added.append(f"{name}: {before:,} -> {after:,} bytes ({100 * after / before:.0f}%)")
 
-        if added:
-            messagebox.showinfo("Videos", "Added:\n" + "\n".join(added))
+        self._progress_queue.put(("done", added))
+
+    def _poll_progress(self) -> None:
+        try:
+            while True:
+                kind, *payload = self._progress_queue.get_nowait()
+                if kind == "status":
+                    name, indeterminate = payload
+                    self.set_status(f"Compressing {name}...")
+                    if indeterminate:
+                        self.progress.config(mode="indeterminate")
+                        self.progress.start(10)
+                    else:
+                        self.progress.stop()
+                        self.progress.config(mode="determinate")
+                        self.progress["value"] = 0
+                elif kind == "progress":
+                    self.progress["value"] = payload[0]
+                elif kind == "error":
+                    messagebox.showerror("Videos", payload[0])
+                elif kind == "done":
+                    self.progress.stop()
+                    self.progress.config(mode="determinate")
+                    self.progress["value"] = 0
+                    self.compress_btn.config(state=tk.NORMAL)
+                    self.refresh()
+                    self.scan_incoming()
+                    added = payload[0]
+                    if added:
+                        messagebox.showinfo("Videos", "Added:\n" + "\n".join(added))
+                    return  # worker thread is done, stop polling
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_progress)
 
     def on_close(self) -> None:
         for tmp in self.temp_files:
